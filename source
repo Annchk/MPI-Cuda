@@ -1,0 +1,387 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <omp.h>
+#include "mpi.h"
+void therm_cond(double tau, double h, double a, double Lx, double Ly, double
+	T, int rank, int size, int thread, int r, int s);
+double get_solution(double t, double x, double y);
+void get_scheme(double* f, double* V, int N, int M, int K, double* t, double*
+	x, double* y, double a, double tau, double h, int m, int n, int rank, int
+	size, int thread, int row, int col);
+void get_start(double* V, int M, int K, double* t, double* x, double* y);
+void get_edge(double* V, int i, int M, int K, double* t, double* x, double*
+	y, int m, int n, int rank, int size, int thread, int row, int col);
+void get_time_X_Y(double* t, double* x, double* y, int N, int R, int S,
+	double tau, double h, int row, int col);
+void print_res(double* Res, int N, int M, int K);
+void get_error_c(double* V, int N, int M, int K, int rank, double* t, double*
+	x, double* y);
+void get_error_L(double* V, int N, int M, int K, int rank, int size, double*
+	t, double* x, double* y);
+double maximum(double x, double y);
+double function(double t, double x, double y, double a);
+double get_func(double t, double x, double y);
+double absolute(double x, double y) {
+	double z;
+	double eps = 1e-7;
+	z = x - y;
+	if (z <= -eps) {
+		z = -z;
+	}
+	return z;
+}
+int main(int argc, char** argv)
+{
+	int size, rank;
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	if (argc != 4) {
+		if (rank == 0) printf("invalid parameters\n");
+		MPI_Finalize(); return 0;
+	}
+	else {
+		//входные параметры
+		double tau = 0.000125;
+		double h = 0.025;
+		double a = 1;
+		double Lx = 20;
+		double Ly = 20;
+		double T = 1;
+		int thread = atoi(argv[1]);
+		int r = atoi(argv[2]); int s = atoi(argv[3]);
+		if (r * s != size) {
+			if (rank == 0) printf("invalid parameters\n");
+			MPI_Finalize(); return 0;
+		}
+		//for (int i = 0; i < 8; ++i) {
+		MPI_Barrier(MPI_COMM_WORLD);
+		double START = MPI_Wtime();
+		therm_cond(tau, h, a, Lx, Ly, T, rank, size, thread, r, s);
+		MPI_Barrier(MPI_COMM_WORLD);
+		double FINISH = MPI_Wtime();
+		if (rank == 0) {
+			printf("\ntau %f h %f\n", tau, h);
+			printf("TIME %f", FINISH - START);
+		}
+		// tau = tau / 4;
+		// h = h / 2;
+		// }
+		MPI_Finalize();
+	}
+}
+void therm_cond(double tau, double h, double a, double Lx, double Ly, double
+	T, int rank, int size, int thread, int r, int s) {
+	int p = r * s;
+	int N = ceil(T / tau) + 1;
+	int M = ceil(Lx / h) + 1;
+	int K = ceil(Ly / h) + 1;
+	int R = M / r;
+	int S = K / s;
+	int P = R * S;
+	int row = rank / s;
+	int col = rank % s;
+	double* V = new double[2 * (R + 2) * (S + 2)];
+	double* t = new double[N];
+	double* x = new double[R];
+	double* y = new double[S];
+	double* f = new double[R * S];
+	//printf("rank %d\n", rank);
+	//инициализируем массивы координат пространства и времени
+	get_time_X_Y(t, x, y, N, R, S, tau, h, row, col);
+	//задаем начальные условия
+	get_start(V, R + 2, S + 2, t, x, y);
+	//находим решение по явной схеме
+	get_scheme(f, V, N, R + 2, S + 2, t, x, y, a, tau, h, r, s, rank, size,
+		thread, row, col);
+	//print_res(V, N, M, K);
+	//ищем ошибку по нормам c и L
+	get_error_c(V, N, R, S, rank, t, x, y);
+	get_error_L(V, N, R, S, rank, size, t, x, y);
+	//освобождаем память
+	delete[] V;
+	delete[] t;
+	delete[] x;
+	delete[] y;
+	delete[] f;
+}
+void get_scheme(double* f, double* V, int N, int M, int K, double* t, double*
+	x, double* y, double a, double tau, double h, int m, int n, int rank, int
+	size, int thread, int row, int col) {
+	MPI_Request rreq, sreq;
+	MPI_Status status;
+	double func;
+	double* tmp = new double[M - 2];
+	double* tmp1 = new double[M - 2];
+	double* tmp2 = new double[K - 2];
+	double* tmp3 = new double[K - 2];
+	//задаем граничные условия
+	int cnt1 = 1; int cnt2 = 1; int cnt3 = 1; int cnt4 = 1;
+	if (rank >= n * (m - 1) && rank <= m * n - 1)
+		cnt2 = 2;
+	if (rank >= 0 && rank <= n - 1)
+		cnt1 = 2;
+	if (rank == 0 || rank % n == 0)
+		cnt3 = 2;
+	if (rank % n - (n - 1) == 0)
+		cnt4 = 2;
+
+	//get_edge(V, N - 1, M, K, t, x, y, m, n, rank, size, thread, row, col);
+	for (int i = 0; i < N - 1; ++i) {
+		get_edge(V, i, M, K, t, x, y, m, n, rank, size, thread, row, col);
+		MPI_Barrier(MPI_COMM_WORLD);
+		if (col % 2 == 1 && n > 1)
+		{
+			if (rank > row * n) {
+				for (int t = 0; t < M - 2; ++t) {
+					tmp[t] = V[K + t * K + 1 + (i % 2) * M * K];
+				}
+			}
+			MPI_Send(&tmp[0], M - 2, MPI_DOUBLE, rank - 1, 1,
+				MPI_COMM_WORLD);
+			if (rank > row * n) {
+				MPI_Recv(&tmp1[0], M - 2, MPI_DOUBLE, rank - 1, 2,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < M - 2; ++t)
+					V[K + t * K + (i % 2) * M * K] = tmp1[t];
+			}
+			if (rank < n - 1 + row * n) {
+				MPI_Recv(&tmp[0], M - 2, MPI_DOUBLE, rank + 1, 3,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < M - 2; ++t)
+					V[K + t * K + K - 1 + (i % 2) * M * K] = tmp[t];
+			}
+			if (rank < n - 1 + row * n) {
+				for (int t = 0; t < M - 2; ++t)
+					tmp1[t] = V[K + t * K + K - 2 + (i % 2) * M * K];
+				MPI_Send(&tmp1[0], M - 2, MPI_DOUBLE, rank + 1, 4,
+					MPI_COMM_WORLD);
+			}
+		}
+		else if (n > 1)
+		{
+			if (rank < n - 1 + row * n) {
+				MPI_Recv(&tmp[0], M - 2, MPI_DOUBLE, rank + 1, 1,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < M - 2; ++t) {
+					V[K + t * K + K - 1 + (i % 2) * M * K] = tmp[t];
+				}
+			}
+			if (rank < n - 1 + row * n) {
+				for (int t = 0; t < M - 2; ++t) {
+					tmp1[t] = V[K + t * K + K - 2 + (i % 2) * M * K];
+				}
+				MPI_Send(&tmp1[0], M - 2, MPI_DOUBLE, rank + 1, 2,
+					MPI_COMM_WORLD);
+			}
+			if (rank > row * n) {
+				for (int t = 0; t < M - 2; ++t)
+					tmp[t] = V[K + t * K + 1 + (i % 2) * M * K];
+				MPI_Send(&tmp[0], M - 2, MPI_DOUBLE, rank - 1, 3,
+					MPI_COMM_WORLD);
+			}
+			if (rank > row * n) {
+				MPI_Recv(&tmp1[0], M - 2, MPI_DOUBLE, rank - 1, 4,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < M - 2; ++t)
+					V[K + t * K + (i % 2) * M * K] = tmp1[t];
+			}
+		}
+		if (row % 2 == 1 && m > 1) // номер строки
+		{
+			if (row != m - 1) {
+				for (int t = 0; t < K - 2; ++t) {
+					tmp2[t] = V[t + 1 + (M - 2) * (K)+(i % 2) * M * K];
+				}
+				MPI_Send(&tmp2[0], K - 2, MPI_DOUBLE, rank + n, 1,
+					MPI_COMM_WORLD);
+				MPI_Recv(&tmp3[0], K - 2, MPI_DOUBLE, rank + n, 2,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < K - 2; ++t)
+					V[t + K * (M - 1) + 1 + (i % 2) * M * K] = tmp3[t];
+			}
+			if (row != 0) {
+				MPI_Recv(&tmp2[0], K - 2, MPI_DOUBLE, rank - n, 3,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < K - 2; ++t) {
+					V[t + 1 + (i % 2) * M * K] = tmp2[t];
+				}
+				for (int t = 0; t < K - 2; ++t) {
+					tmp3[t] = V[t + K + 1 + (i % 2) * M * K];
+				}
+				MPI_Send(&tmp3[0], K - 2, MPI_DOUBLE, rank - n, 4,
+					MPI_COMM_WORLD);
+			}
+		}
+		else if (m > 1)
+		{
+			if (row != 0) {
+				MPI_Recv(&tmp2[0], K - 2, MPI_DOUBLE, rank - n, 1,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < K - 2; ++t) {
+					V[t + 1 + (i % 2) * M * K] = tmp2[t];
+				}
+				for (int t = 0; t < K - 2; ++t) {
+					tmp3[t] = V[t + K + 1 + (i % 2) * M * K];
+				}
+				MPI_Send(&tmp3[0], K - 2, MPI_DOUBLE, rank - n, 2,
+					MPI_COMM_WORLD);
+			}
+			if (row != m - 1) {
+				for (int t = 0; t < K - 2; ++t) {
+					tmp2[t] = V[t + 1 + (M - 2) * (K)+(i % 2) * M * K];
+				}
+				MPI_Send(&tmp2[0], K - 2, MPI_DOUBLE, rank + n, 3,
+					MPI_COMM_WORLD);
+				MPI_Recv(&tmp3[0], K - 2, MPI_DOUBLE, rank + n, 4,
+					MPI_COMM_WORLD, &status);
+				for (int t = 0; t < K - 2; ++t) {
+					V[t + K * (M - 1) + 1 + (i % 2) * M * K] = tmp3[t];
+				}
+			}
+		}
+#pragma omp parallel num_threads(thread)
+#pragma omp for collapse(2) private(func)
+		for (int j = cnt1; j < M - cnt2; ++j) {
+			for (int k = cnt3; k < K - cnt4; ++k) {
+				//задаем функцию f(t,x,y)
+				//f[(k - cnt3) + (j - cnt1) * (K - 2)] = (2 * t[i] + 5 * a *
+				a* (t[i] * t[i] + 1))* cos(x[j - 1])* cos(2 * y[k - 1]);
+				//func = (2 * t[i] + 5 * a * a * (t[i] * t[i] + 1)) * cos(x[j
+				-1])* cos(2 * y[k - 1]);
+				func = function(t[i], x[j - 1], y[k - 1], a);
+				V[k + j * K + (abs(i % 2 - 1)) * M * K] = a * a * tau / (h *
+					h) * (V[k + (j + 1) * K + (i % 2) * M * K] - 2 * V[k + j * K + (i % 2) * M *
+						K] + V[k + (j - 1) * K + (i % 2) * M * K]
+						+ V[(k + 1) + j * K + (i % 2) * M * K] - 2 * V[k + j * K
+						+ (i % 2) * M * K] + V[(k - 1) + j * K + (i % 2) * M * K])
+					+ tau * func
+					+ V[k + j * K + (i % 2) * M * K];
+			}
+		}
+	}
+	get_edge(V, N - 1, M, K, t, x, y, m, n, rank, size, thread, row, col);
+	delete[] tmp;
+	delete[] tmp1;
+	delete[] tmp2;
+	delete[] tmp3;
+}
+double function(double t, double x, double y, double a) {
+	double f;
+	f = (2 * t + 5 * a * a * (t * t + 1)) * cos(x) * cos(2 * y);
+	return f;
+}
+double get_func(double t, double x, double y) {
+	double f;
+	f = (t * t + 1) * cos(x) * cos(2 * y);
+	return f;
+}
+void get_start(double* V, int M, int K, double* t, double* x, double* y) {
+	for (int j = 1; j < M - 1; ++j) {
+		for (int k = 1; k < K - 1; ++k) {
+			V[k + j * K] = get_func(0, x[j - 1], y[k - 1]);
+		}
+	}
+}
+void get_edge(double* V, int i, int M, int K, double* t, double* x, double*
+	y, int m, int n, int rank, int size, int thread, int row, int col) {
+	if (rank >= n * (m - 1) && rank <= m * n - 1) {
+#pragma omp parallel num_threads(thread)
+#pragma omp for
+		for (int k = 1; k < K - 1; ++k) {
+			V[k + K * (M - 2) + (i % 2) * M * K] = get_func(t[i], x[M - 3],
+				y[k - 1]);
+		}
+	}
+	if (rank >= 0 && rank <= n - 1) {
+#pragma omp parallel num_threads(thread)
+#pragma omp for
+		for (int k = 1; k < K - 1; ++k) {
+			V[k + K + (i % 2) * M * K] = get_func(t[i], x[0], y[k - 1]);
+		}
+	}
+	if (col == 0) {
+#pragma omp parallel num_threads(thread)
+#pragma omp for
+		for (int j = 1; j < M - 1; ++j) {
+			V[1 + j * K + (i % 2) * M * K] = get_func(t[i], x[j - 1], y[0]);
+		}
+	}
+	if (col - (n - 1) == 0) {
+#pragma omp parallel num_threads(thread)
+#pragma omp for
+		for (int j = 1; j < M - 1; ++j) {
+			V[K - 2 + j * K + (i % 2) * M * K] = get_func(t[i], x[j - 1], y[K
+				- 3]);
+		}
+	}
+}
+double get_solution(double t, double x, double y) {
+	double U;
+	U = get_func(t, x, y);
+	return U;
+}
+void get_time_X_Y(double* t, double* x, double* y, int N, int R, int S,
+	double tau, double h, int row, int col) {
+	for (int i = 0; i < N; ++i) {
+		t[i] = i * tau;
+	}
+	for (int i = 0; i < R; ++i) {
+		x[i] = (double)(i + row * R) * h;
+	}
+	for (int i = 0; i < S; ++i) {
+		y[i] = (double)(i + col * S) * h;
+	}
+}
+void get_error_c(double* V, int N, int M, int K, int rank, double* t, double*
+	x, double* y) {
+	double norm_c = absolute(get_solution(t[N - 1], x[0], y[0]), V[N % 2 * (M
+		+ 2) * (K + 2) + K + 3]);
+	double max, max1 = -5;
+	for (int i = 0; i < M; ++i) {
+		for (int j = 0; j < K; ++j) {
+			//max = absolute(U[j + i * K], V[j + K + 3 + (i) * (K + 2) + N %
+			2 * (M + 2) * (K + 2)]);
+			max = absolute(get_solution(t[N - 1], x[i], y[j]), V[j + K + 3 +
+				(i) * (K + 2) + N % 2 * (M + 2) * (K + 2)]);
+			if (norm_c < max) norm_c = max;
+		}
+	}
+	MPI_Reduce(&norm_c, &max1, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+	if (rank == 0)
+		printf("\nERROR C %.5f\n", max1);
+}
+void get_error_L(double* V, int N, int M, int K, int rank, int size, double*
+	t, double* x, double* y) {
+	double sum = 0, SUM = 0;
+	for (int i = 0; i < M; i++) {
+		for (int j = 0; j < K; j++) {
+			//sum = sum + pow((U[j + i * K] - V[j + K + 3 + (i) * (K + 2) + N
+			% 2 * (M + 2) * (K + 2)]), 2);
+			sum = sum + pow((get_solution(t[N - 1], x[i], y[j]) - V[j + K + 3
+				+ (i) * (K + 2) + N % 2 * (M + 2) * (K + 2)]), 2);
+		}
+	}
+	MPI_Reduce(&sum, &SUM, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+	if (rank == 0) {
+		printf("\n%f\n", SUM);
+		double norm_L = sqrt(SUM / ((double)M * (double)K * (double)size));
+		printf("\nERROR L %.8f\n", norm_L);
+	}
+}
+double maximum(double x, double y) {
+	double z;
+	if (x > y) z = x;
+	else z = y;
+	return z;
+}
+void print_res(double* Res, int i, int M, int K) {
+	for (int j = 1; j < M - 1; ++j) {
+		for (int k = 1; k < K - 1; ++k) {
+			printf("%.5f ", Res[k + j * K + i * M * K]);
+		}
+		printf("\n");
+	}
+	printf("\n\n");
+}
